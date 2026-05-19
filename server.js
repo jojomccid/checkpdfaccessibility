@@ -107,3 +107,27 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
 });
+
+// ============================================
+// 🆕 NEW CODE: Add scanned PDF processing here
+// ============================================
+
+async function processScannedPDF(pdfPath) {
+    // Your new OCR code here
+    console.log('Processing scanned PDF:', pdfPath);
+    return "Extracted text from scanned document";
+}
+
+// You can also add new endpoints here, ABOVE app.listen()
+app.post('/api/ocr-test', (req, res) => {
+    res.json({ message: "OCR test endpoint working" });
+});
+
+// ============================================
+// ⚠️ THIS MUST REMAIN THE VERY LAST LINE
+// ============================================
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+    console.log(`API key configured: ${DEEPSEEK_API_KEY ? 'YES' : 'NO'}`);
+});
