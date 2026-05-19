@@ -102,14 +102,8 @@ app.get('/health', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// For local development
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-});
-
 // ============================================
-// 🆕 NEW CODE: Add scanned PDF processing here
+// 🆕 NEW CODE: Scanned PDF processing
 // ============================================
 
 async function processScannedPDF(pdfPath) {
@@ -118,13 +112,13 @@ async function processScannedPDF(pdfPath) {
     return "Extracted text from scanned document";
 }
 
-// You can also add new endpoints here, ABOVE app.listen()
+// OCR test endpoint
 app.post('/api/ocr-test', (req, res) => {
     res.json({ message: "OCR test endpoint working" });
 });
 
 // ============================================
-// ⚠️ THIS MUST REMAIN THE VERY LAST LINE
+// ⚠️ SINGLE app.listen() - THIS IS THE ONLY ONE
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
