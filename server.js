@@ -6,7 +6,28 @@ const path = require('path');
 const fs = require('fs');
 
 const app = express();
-const upload = multer({ dest: 'uploads/' });
+
+// Configure multer with unique filenames to prevent conflicts
+const storage = multer.diskStorage({
+    destination: function (req, file, cb) {
+        const uploadDir = './uploads';
+        // Create uploads directory if it doesn't exist
+        if (!fs.existsSync(uploadDir)) {
+            fs.mkdirSync(uploadDir);
+        }
+        cb(null, uploadDir);
+    },
+    filename: function (req, file, cb) {
+        // Generate unique filename with timestamp
+        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+        cb(null, uniqueSuffix + '-' + file.originalname);
+    }
+});
+
+const upload = multer({ 
+    storage: storage,
+    limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
+});
 
 // Serve static files (your index.html from public folder)
 app.use(express.static('public'));
@@ -15,6 +36,24 @@ app.use(express.json());
 // DeepSeek API configuration
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
 const DEEPSEEK_API_URL = 'https://api.deepseek.com/v1/chat/completions';
+
+// Clean up old files periodically (every hour)
+setInterval(() => {
+    const uploadDir = './uploads';
+    if (fs.existsSync(uploadDir)) {
+        const files = fs.readdirSync(uploadDir);
+        const now = Date.now();
+        files.forEach(file => {
+            const filePath = path.join(uploadDir, file);
+            const stats = fs.statSync(filePath);
+            // Delete files older than 1 hour
+            if (now - stats.mtimeMs > 60 * 60 * 1000) {
+                fs.unlinkSync(filePath);
+                console.log(`Cleaned up old file: ${file}`);
+            }
+        });
+    }
+}, 60 * 60 * 1000);
 
 // Health check endpoint
 app.get('/health', (req, res) => {
@@ -25,17 +64,20 @@ app.get('/health', (req, res) => {
     });
 });
 
-// Endpoint to analyze PDF - Improved version that handles ALL PDFs
+// Endpoint to analyze PDF
 app.post('/api/analyze', upload.single('pdf'), async (req, res) => {
+    let filePath = null;
+    
     try {
         if (!req.file) {
             return res.status(400).json({ error: 'No PDF file uploaded' });
         }
 
-        console.log(`Processing: ${req.file.originalname}`);
+        filePath = req.file.path;
+        console.log(`[${new Date().toISOString()}] Processing: ${req.file.originalname}`);
 
-        // Extract text with better error handling
-        const pdfBuffer = fs.readFileSync(req.file.path);
+        // Extract text from PDF
+        const pdfBuffer = fs.readFileSync(filePath);
         let extractedText = '';
         
         try {
@@ -44,13 +86,15 @@ app.post('/api/analyze', upload.single('pdf'), async (req, res) => {
             console.log(`Extracted ${extractedText.length} characters`);
         } catch (parseError) {
             console.error('PDF parse error:', parseError.message);
-            // Fallback: Try to extract whatever is readable
-            extractedText = "Text extraction partially failed. The PDF may contain complex structure, but analysis can still proceed on available content.";
+            extractedText = "Text extraction encountered issues. Analysis will proceed on available content.";
         }
         
         // If no text at all, provide a helpful message
         if (!extractedText || extractedText.trim().length < 50) {
-            fs.unlinkSync(req.file.path);
+            // Clean up file before responding
+            if (filePath && fs.existsSync(filePath)) {
+                fs.unlinkSync(filePath);
+            }
             return res.json({
                 overallScore: 0,
                 issues: [{
@@ -65,7 +109,6 @@ app.post('/api/analyze', upload.single('pdf'), async (req, res) => {
         // Truncate for API limits
         const textForAnalysis = extractedText.substring(0, 8000);
 
-        // Improved prompt that works with any extracted text
         const analysisPrompt = `You are a WCAG 2.1 Level AA accessibility auditor. 
         
 Analyze this PDF document text and provide:
@@ -79,7 +122,7 @@ If the text is raw, unstructured, or missing key elements, give a LOWER score.
 Document text:
 ${textForAnalysis}
 
-Respond with ONLY valid JSON. Do not include any other text outside the JSON. Use this exact format:
+Respond with ONLY valid JSON. Use this exact format:
 {
     "overallScore": number,
     "issues": [
@@ -97,7 +140,7 @@ Respond with ONLY valid JSON. Do not include any other text outside the JSON. Us
         const deepseekResponse = await axios.post(DEEPSEEK_API_URL, {
             model: "deepseek-chat",
             messages: [
-                { role: "system", content: "You are a WCAG 2.1 AA accessibility compliance expert. Respond only with valid JSON. Do not include explanations, markdown formatting, or any text outside the JSON structure." },
+                { role: "system", content: "You are a WCAG 2.1 AA accessibility compliance expert. Respond only with valid JSON. No explanations, no markdown, just JSON." },
                 { role: "user", content: analysisPrompt }
             ],
             temperature: 0.3
@@ -109,13 +152,12 @@ Respond with ONLY valid JSON. Do not include any other text outside the JSON. Us
             timeout: 45000
         });
 
-        // Parse the response more robustly
+        // Parse the response
         let analysisResult;
         const responseContent = deepseekResponse.data.choices[0].message.content;
-        console.log('DeepSeek response received, length:', responseContent.length);
+        console.log('DeepSeek response received');
         
         try {
-            // Try to extract JSON if there's extra text
             const jsonMatch = responseContent.match(/\{[\s\S]*\}/);
             if (jsonMatch) {
                 analysisResult = JSON.parse(jsonMatch[0]);
@@ -124,15 +166,14 @@ Respond with ONLY valid JSON. Do not include any other text outside the JSON. Us
             }
         } catch (parseError) {
             console.error('JSON parse error:', parseError.message);
-            // Provide meaningful fallback
             analysisResult = {
-                overallScore: 45,
+                overallScore: 50,
                 issues: [{
                     wcagCriterion: "Analysis parsing",
                     severity: "Minor",
-                    fixRecommendation: "The analysis completed but had formatting issues. The PDF appears to have some structure."
+                    fixRecommendation: "The analysis completed but had formatting issues."
                 }],
-                summary: "Partial analysis: The document contains text but the detailed breakdown encountered a parsing issue."
+                summary: "Partial analysis completed."
             };
         }
 
@@ -141,28 +182,26 @@ Respond with ONLY valid JSON. Do not include any other text outside the JSON. Us
             analysisResult.overallScore = 50;
         }
 
-        // Clean up uploaded file
-        try {
-            fs.unlinkSync(req.file.path);
-        } catch(e) {
-            console.log('File cleanup warning:', e.message);
+        // ALWAYS clean up the uploaded file
+        if (filePath && fs.existsSync(filePath)) {
+            fs.unlinkSync(filePath);
+            console.log(`Cleaned up: ${filePath}`);
         }
 
         res.json(analysisResult);
 
     } catch (error) {
         console.error('Analysis error:', error.message);
-        if (error.response) {
-            console.error('API status:', error.response.status);
-            console.error('API data:', error.response.data);
-        }
         
-        // Clean up file if it exists
-        try {
-            if (req.file && fs.existsSync(req.file.path)) {
-                fs.unlinkSync(req.file.path);
+        // ALWAYS clean up the uploaded file, even on error
+        if (filePath && fs.existsSync(filePath)) {
+            try {
+                fs.unlinkSync(filePath);
+                console.log(`Cleaned up on error: ${filePath}`);
+            } catch(e) {
+                console.log('Cleanup error:', e.message);
             }
-        } catch(e) {}
+        }
         
         res.status(500).json({ 
             error: 'Analysis failed', 
@@ -171,16 +210,21 @@ Respond with ONLY valid JSON. Do not include any other text outside the JSON. Us
             issues: [{
                 wcagCriterion: "Processing error",
                 severity: "Critical",
-                fixRecommendation: "The PDF could not be analyzed. Please ensure it is a valid PDF file and try again."
+                fixRecommendation: "The PDF could not be analyzed. Please try again."
             }],
-            summary: 'Unable to complete accessibility analysis due to a technical error.'
+            summary: 'Unable to complete accessibility analysis.'
         });
     }
 });
 
-// OCR test endpoint (placeholder for future enhancement)
-app.post('/api/ocr-test', (req, res) => {
-    res.json({ message: "OCR test endpoint working" });
+// Debug endpoint
+app.get('/api/debug', (req, res) => {
+    res.json({
+        hasApiKey: !!process.env.DEEPSEEK_API_KEY,
+        apiKeyPrefix: process.env.DEEPSEEK_API_KEY ? process.env.DEEPSEEK_API_KEY.substring(0, 10) + '...' : 'missing',
+        nodeVersion: process.version,
+        timestamp: new Date().toISOString()
+    });
 });
 
 // ============================================
@@ -190,4 +234,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
     console.log(`API key configured: ${DEEPSEEK_API_KEY ? 'YES' : 'NO'}`);
+    console.log(`Uploads directory: ./uploads`);
 });
