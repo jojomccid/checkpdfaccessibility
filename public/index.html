@@ -1,607 +1,160 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Check PDF Accessibility | WCAG 2.1 Compliance Tool</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
+// Endpoint to analyze PDF with standard selection
+app.post('/api/analyze', upload.single('pdf'), async (req, res) => {
+    let filePath = null;
+    
+    try {
+        if (!req.file) {
+            return res.status(400).json({ error: 'No PDF file uploaded' });
         }
 
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            color: #333;
+        // Get selected standard (default to wcag21)
+        const selectedStandard = req.body.standard || 'wcag21';
+        
+        filePath = req.file.path;
+        console.log(`[${new Date().toISOString()}] Processing: ${req.file.originalname} against ${selectedStandard}`);
+
+        // Extract text from PDF
+        const pdfBuffer = fs.readFileSync(filePath);
+        let extractedText = '';
+        
+        try {
+            const pdfData = await pdfParse(pdfBuffer);
+            extractedText = pdfData.text;
+            console.log(`Extracted ${extractedText.length} characters`);
+        } catch (parseError) {
+            console.error('PDF parse error:', parseError.message);
+            extractedText = "Text extraction encountered issues. Analysis will proceed on available content.";
+        }
+        
+        if (!extractedText || extractedText.trim().length < 50) {
+            if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
+            return res.json({
+                overallScore: 0,
+                issues: [{ wcagCriterion: "No readable text", severity: "Critical", fixRecommendation: "This PDF appears to be an image or has no selectable text. OCR processing is required." }],
+                summary: "No text content could be extracted."
+            });
         }
 
-        /* Accessibility Skip Link */
-        .skip-link {
-            position: absolute;
-            top: -40px;
-            left: 0;
-            background: #000;
-            color: white;
-            padding: 8px;
-            text-decoration: none;
-            z-index: 100;
+        const textForAnalysis = extractedText.substring(0, 8000);
+
+        // Build prompt based on selected standard
+        let systemPrompt, analysisPrompt;
+        
+        if (selectedStandard === 'pdfua') {
+            systemPrompt = "You are a PDF/UA-1 (ISO 14289) accessibility compliance expert. PDF/UA requires proper tags (headings, lists, tables), correct reading order, alt text for images, language specification, and no untagged annotations. Respond only with valid JSON.";
+            analysisPrompt = `You are a PDF/UA-1 (ISO 14289) accessibility auditor. 
+            
+Analyze this PDF document text and determine if it would meet PDF/UA-1 requirements. Look for evidence of:
+1. Proper heading structure (H1-H6 hierarchy)
+2. List tags (ul, ol, li)
+3. Table headers (th with scope)
+4. Alt text for images
+5. Document language specification
+6. Logical reading order
+7. Metadata (title, author)
+
+Document text:
+${textForAnalysis}
+
+Respond with ONLY valid JSON in this format:
+{
+    "overallScore": number (0-100),
+    "issues": [
+        {
+            "wcagCriterion": "PDF/UA requirement name",
+            "severity": "Critical/Serious/Minor",
+            "fixRecommendation": "How to fix this issue"
         }
-        .skip-link:focus {
-            top: 0;
+    ],
+    "summary": "Overall assessment"
+}`;
+        } else {
+            // WCAG 2.1 AA (default)
+            systemPrompt = "You are a WCAG 2.1 Level AA accessibility compliance expert. Respond only with valid JSON. Do not include explanations, markdown formatting, or any text outside the JSON structure.";
+            analysisPrompt = `You are a WCAG 2.1 Level AA accessibility auditor. 
+            
+Analyze this PDF document text and provide:
+1. An overall compliance score from 0-100%
+2. List of issues found with specific WCAG criteria violations
+3. For each issue, include: severity (Critical/Serious/Minor), WCAG criterion, and fix recommendation
+
+Document text:
+${textForAnalysis}
+
+Respond with ONLY valid JSON in this format:
+{
+    "overallScore": number,
+    "issues": [
+        {
+            "wcagCriterion": string,
+            "severity": string,
+            "fixRecommendation": string
+        }
+    ],
+    "summary": string
+}`;
         }
 
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 2rem;
-        }
-
-        /* Header */
-        .header {
-            text-align: center;
-            padding: 3rem 1rem;
-            color: white;
-        }
-        .header h1 {
-            font-size: 2.5rem;
-            margin-bottom: 1rem;
-            font-weight: 700;
-        }
-        .header p {
-            font-size: 1.2rem;
-            opacity: 0.95;
-            max-width: 600px;
-            margin: 0 auto;
-        }
-        .badge {
-            display: inline-block;
-            background: rgba(255,255,255,0.2);
-            padding: 0.5rem 1rem;
-            border-radius: 50px;
-            font-size: 0.85rem;
-            margin-top: 1rem;
-        }
-
-        /* Main Card */
-        .card {
-            background: white;
-            border-radius: 24px;
-            padding: 2.5rem;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.15);
-            margin-bottom: 2rem;
-        }
-
-        /* Upload Area */
-        .upload-area {
-            border: 2px dashed #cbd5e1;
-            border-radius: 16px;
-            padding: 3rem 2rem;
-            text-align: center;
-            transition: all 0.3s ease;
-            cursor: pointer;
-            background: #f8fafc;
-        }
-        .upload-area:hover, .upload-area.drag-over {
-            border-color: #667eea;
-            background: #eef2ff;
-        }
-        .upload-icon {
-            font-size: 3rem;
-            margin-bottom: 1rem;
-        }
-        .upload-area input {
-            display: none;
-        }
-        .upload-btn {
-            background: #667eea;
-            color: white;
-            border: none;
-            padding: 0.75rem 2rem;
-            border-radius: 50px;
-            font-size: 1rem;
-            cursor: pointer;
-            margin-top: 1rem;
-            transition: background 0.3s;
-        }
-        .upload-btn:hover {
-            background: #5a67d8;
-        }
-        .file-info {
-            margin-top: 1rem;
-            font-size: 0.9rem;
-            color: #64748b;
-        }
-
-        /* Loading State */
-        .loading {
-            text-align: center;
-            padding: 2rem;
-            display: none;
-        }
-        .spinner {
-            width: 50px;
-            height: 50px;
-            border: 4px solid #e2e8f0;
-            border-top-color: #667eea;
-            border-radius: 50%;
-            animation: spin 1s linear infinite;
-            margin: 0 auto 1rem;
-        }
-        @keyframes spin {
-            to { transform: rotate(360deg); }
-        }
-
-        /* Results Section */
-        .results {
-            display: none;
-            margin-top: 2rem;
-        }
-
-        /* Scorecard */
-        .scorecard {
-            background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%);
-            border-radius: 16px;
-            padding: 1.5rem;
-            margin-bottom: 1.5rem;
-        }
-        .score-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 1rem;
-        }
-        .score-circle {
-            width: 120px;
-            height: 120px;
-            border-radius: 50%;
-            background: white;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
-        }
-        .score-number {
-            font-size: 2.5rem;
-            font-weight: bold;
-        }
-        .score-label {
-            font-size: 0.85rem;
-            color: #64748b;
-        }
-        .status-badge {
-            padding: 0.5rem 1rem;
-            border-radius: 50px;
-            font-weight: 600;
-        }
-        .status-pass {
-            background: #22c55e;
-            color: white;
-        }
-        .status-fail {
-            background: #ef4444;
-            color: white;
-        }
-        .status-warning {
-            background: #f59e0b;
-            color: white;
-        }
-
-        /* Issues List */
-        .issues-list {
-            margin-top: 1.5rem;
-        }
-        .issue-item {
-            background: white;
-            border-left: 4px solid;
-            padding: 1rem;
-            margin-bottom: 0.75rem;
-            border-radius: 8px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-        }
-        .issue-critical { border-left-color: #ef4444; }
-        .issue-serious { border-left-color: #f59e0b; }
-        .issue-minor { border-left-color: #3b82f6; }
-        .issue-title {
-            font-weight: 600;
-            margin-bottom: 0.5rem;
-        }
-        .issue-wcag {
-            font-family: monospace;
-            font-size: 0.8rem;
-            color: #64748b;
-        }
-        .issue-fix {
-            margin-top: 0.5rem;
-            font-size: 0.9rem;
-            color: #22c55e;
-        }
-
-        /* Action Buttons */
-        .action-buttons {
-            display: flex;
-            gap: 1rem;
-            margin: 1.5rem 0;
-            flex-wrap: wrap;
-        }
-        .btn {
-            padding: 0.75rem 1.5rem;
-            border-radius: 50px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.3s;
-            border: none;
-            font-size: 0.95rem;
-        }
-        .btn-primary {
-            background: #667eea;
-            color: white;
-        }
-        .btn-primary:hover {
-            background: #5a67d8;
-            transform: translateY(-2px);
-        }
-        .btn-secondary {
-            background: #e2e8f0;
-            color: #333;
-        }
-        .btn-secondary:hover {
-            background: #cbd5e1;
-        }
-        .btn-success {
-            background: #22c55e;
-            color: white;
-        }
-
-        /* Features Grid */
-        .features {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 1.5rem;
-            margin-top: 2rem;
-        }
-        .feature {
-            background: white;
-            padding: 1.5rem;
-            border-radius: 16px;
-            text-align: center;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.05);
-        }
-        .feature-icon {
-            font-size: 2rem;
-            margin-bottom: 0.75rem;
-        }
-        .feature h3 {
-            margin-bottom: 0.5rem;
-        }
-        .feature p {
-            font-size: 0.9rem;
-            color: #64748b;
-        }
-
-        /* Footer */
-        .footer {
-            text-align: center;
-            padding: 2rem;
-            color: white;
-            font-size: 0.85rem;
-        }
-        .footer a {
-            color: white;
-            text-decoration: underline;
-        }
-
-        @media (max-width: 768px) {
-            .container { padding: 1rem; }
-            .card { padding: 1.5rem; }
-            .header h1 { font-size: 1.8rem; }
-            .score-header { flex-direction: column; text-align: center; }
-        }
-    </style>
-</head>
-<body>
-    <a href="#main-content" class="skip-link">Skip to main content</a>
-
-    <div class="container">
-        <div class="header">
-            <h1>📄 Check PDF Accessibility</h1>
-            <p>WCAG 2.1 Level AA compliance testing for your PDF documents</p>
-            <div class="badge">✨ Free accessibility audit — instant results</div>
-        </div>
-
-        <div class="card" id="main-content">
-            <!-- Upload Area -->
-            <div class="upload-area" id="uploadArea">
-                <div class="upload-icon">📁</div>
-                <p>Drag & drop your PDF here or click to browse</p>
-                <input type="file" id="fileInput" accept=".pdf" />
-                <button class="upload-btn" id="uploadBtn">Choose PDF File</button>
-                <div class="file-info" id="fileInfo"></div>
-            </div>
-
-            <!-- Loading State -->
-            <div class="loading" id="loading">
-                <div class="spinner"></div>
-                <p>Analyzing your PDF against WCAG 2.1 AA standards...</p>
-                <p style="font-size: 0.85rem; color: #64748b;">This usually takes 10-20 seconds</p>
-            </div>
-
-            <!-- Results Section -->
-            <div class="results" id="results">
-                <div class="scorecard" id="scorecard"></div>
-                <div class="action-buttons" id="actionButtons"></div>
-                <div id="issuesContainer"></div>
-            </div>
-        </div>
-
-        <div class="features">
-            <div class="feature">
-                <div class="feature-icon">♿</div>
-                <h3>WCAG 2.1 AA</h3>
-                <p>Full compliance testing against all Level A and AA success criteria</p>
-            </div>
-            <div class="feature">
-                <div class="feature-icon">🔧</div>
-                <h3>Auto-Remediation</h3>
-                <p>Convert to screen reader compatible PDF (JAWS, NVDA)</p>
-            </div>
-            <div class="feature">
-                <div class="feature-icon">📊</div>
-                <h3>Detailed Scorecard</h3>
-                <p>Get a percentage score and actionable fix recommendations</p>
-            </div>
-            <div class="feature">
-                <div class="feature-icon">🔒</div>
-                <h3>Privacy First</h3>
-                <p>Your files are never stored permanently. Processed & deleted.</p>
-            </div>
-        </div>
-
-        <div class="footer">
-            <p>© 2025 checkpdfaccessibility.com — Making documents accessible for everyone</p>
-            <p>Compatible with: JAWS, NVDA, VoiceOver, TalkBack</p>
-        </div>
-    </div>
-
-    <script>
-        // DOM Elements
-        const uploadArea = document.getElementById('uploadArea');
-        const fileInput = document.getElementById('fileInput');
-        const uploadBtn = document.getElementById('uploadBtn');
-        const fileInfo = document.getElementById('fileInfo');
-        const loading = document.getElementById('loading');
-        const resultsDiv = document.getElementById('results');
-        const scorecardDiv = document.getElementById('scorecard');
-        const actionButtonsDiv = document.getElementById('actionButtons');
-        const issuesContainer = document.getElementById('issuesContainer');
-
-        let currentAnalysisData = null;
-
-        // Drag & Drop handlers
-        uploadArea.addEventListener('dragover', (e) => {
-            e.preventDefault();
-            uploadArea.classList.add('drag-over');
+        console.log(`Calling DeepSeek API for ${selectedStandard} analysis...`);
+        
+        const deepseekResponse = await axios.post(DEEPSEEK_API_URL, {
+            model: "deepseek-chat",
+            messages: [
+                { role: "system", content: systemPrompt },
+                { role: "user", content: analysisPrompt }
+            ],
+            temperature: 0.3
+        }, {
+            headers: { 
+                'Authorization': `Bearer ${DEEPSEEK_API_KEY}`,
+                'Content-Type': 'application/json'
+            },
+            timeout: 45000
         });
 
-        uploadArea.addEventListener('dragleave', () => {
-            uploadArea.classList.remove('drag-over');
-        });
-
-        uploadArea.addEventListener('drop', (e) => {
-            e.preventDefault();
-            uploadArea.classList.remove('drag-over');
-            const file = e.dataTransfer.files[0];
-            if (file && file.type === 'application/pdf') {
-                handleFile(file);
+        let analysisResult;
+        const responseContent = deepseekResponse.data.choices[0].message.content;
+        
+        try {
+            const jsonMatch = responseContent.match(/\{[\s\S]*\}/);
+            if (jsonMatch) {
+                analysisResult = JSON.parse(jsonMatch[0]);
             } else {
-                alert('Please upload a PDF file');
+                analysisResult = JSON.parse(responseContent);
             }
+        } catch (parseError) {
+            console.error('JSON parse error:', parseError.message);
+            analysisResult = {
+                overallScore: 50,
+                issues: [{ wcagCriterion: "Analysis parsing", severity: "Minor", fixRecommendation: "The analysis completed but had formatting issues." }],
+                summary: "Partial analysis completed."
+            };
+        }
+
+        if (typeof analysisResult.overallScore !== 'number') analysisResult.overallScore = 50;
+
+        // Clean up
+        if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
+
+        // Return result with standard info
+        res.json({
+            [selectedStandard]: analysisResult,
+            standard: selectedStandard,
+            timestamp: new Date().toISOString()
         });
 
-        uploadBtn.addEventListener('click', () => {
-            fileInput.click();
+    } catch (error) {
+        console.error('Analysis error:', error.message);
+        if (filePath && fs.existsSync(filePath)) {
+            try { fs.unlinkSync(filePath); } catch(e) {}
+        }
+        
+        res.status(500).json({ 
+            error: 'Analysis failed', 
+            details: error.message,
+            overallScore: 0,
+            issues: [{ wcagCriterion: "Processing error", severity: "Critical", fixRecommendation: "Please try again." }],
+            summary: 'Unable to complete accessibility analysis.'
         });
-
-        fileInput.addEventListener('change', (e) => {
-            if (e.target.files[0]) {
-                handleFile(e.target.files[0]);
-            }
-        });
-
-        // Handle file upload and analysis
-        async function handleFile(file) {
-            // Show file info
-            fileInfo.textContent = `📄 Selected: ${file.name} (${(file.size / 1024).toFixed(1)} KB)`;
-            
-            // Hide upload area visual, show loading
-            uploadArea.style.opacity = '0.5';
-            loading.style.display = 'block';
-            resultsDiv.style.display = 'none';
-
-            const formData = new FormData();
-            formData.append('pdf', file);
-
-            try {
-                // Step 1: Analyze the PDF
-                const response = await fetch('/api/analyze', {
-                    method: 'POST',
-                    body: formData
-                });
-
-                if (!response.ok) {
-                    throw new Error(`Server error: ${response.status}`);
-                }
-
-                const analysis = await response.json();
-                currentAnalysisData = analysis;
-                displayResults(analysis);
-
-            } catch (error) {
-                console.error('Error:', error);
-                alert('Analysis failed. Please ensure your PDF is not corrupted and try again.');
-                
-                // Reset UI
-                uploadArea.style.opacity = '1';
-                loading.style.display = 'none';
-                fileInfo.textContent = '';
-            }
-        }
-
-        // Display WCAG compliance results
-        function displayResults(data) {
-            const score = data.overallScore || 0;
-            const passed = score >= 80;
-            const needsWork = score >= 50 && score < 80;
-            
-            // Determine status
-            let statusClass = 'status-fail';
-            let statusText = '❌ FAILING';
-            if (passed) {
-                statusClass = 'status-pass';
-                statusText = '✅ PASSING';
-            } else if (needsWork) {
-                statusClass = 'status-warning';
-                statusText = '⚠️ NEEDS IMPROVEMENT';
-            }
-
-            // Scorecard HTML
-            scorecardDiv.innerHTML = `
-                <div class="score-header">
-                    <div class="score-circle">
-                        <div>
-                            <div class="score-number">${score}%</div>
-                            <div class="score-label">Compliance</div>
-                        </div>
-                    </div>
-                    <div>
-                        <span class="status-badge ${statusClass}">${statusText}</span>
-                        <p style="margin-top: 0.5rem;">WCAG 2.1 Level AA</p>
-                    </div>
-                </div>
-                <div style="margin-top: 1rem;">
-                    <strong>Summary:</strong> ${data.summary || 'Analysis complete. Review issues below for specific violations.'}
-                </div>
-            `;
-
-            // Issues list
-            if (data.issues && data.issues.length > 0) {
-                issuesContainer.innerHTML = `
-                    <h3>📋 Accessibility Issues Found (${data.issues.length})</h3>
-                    ${data.issues.map(issue => {
-                        let severityClass = 'issue-minor';
-                        if (issue.severity === 'Critical') severityClass = 'issue-critical';
-                        else if (issue.severity === 'Serious') severityClass = 'issue-serious';
-                        
-                        return `
-                            <div class="issue-item ${severityClass}">
-                                <div class="issue-title">
-                                    ${issue.wcagCriterion || 'WCAG Criterion Not Specified'}
-                                    <span class="issue-wcag"> — ${issue.severity || 'Unknown'} Severity</span>
-                                </div>
-                                <div>${issue.fixRecommendation || issue.elementLocation || 'No specific fix provided'}</div>
-                                ${issue.fixRecommendation ? `<div class="issue-fix">🔧 Fix: ${issue.fixRecommendation}</div>` : ''}
-                            </div>
-                        `;
-                    }).join('')}
-                `;
-            } else {
-                issuesContainer.innerHTML = `
-                    <div style="background: #f0fdf4; padding: 1rem; border-radius: 12px; text-align: center;">
-                        🎉 No accessibility issues detected! Your PDF meets WCAG 2.1 AA standards.
-                    </div>
-                `;
-            }
-
-            // Action buttons based on compliance
-            let buttonsHtml = '';
-            if (!passed) {
-                buttonsHtml = `
-                    <button class="btn btn-primary" id="remediateBtn">♿ Make PDF Screen Reader Compatible</button>
-                    <button class="btn btn-secondary" id="downloadScorecardBtn">📊 Download Scorecard</button>
-                `;
-            } else {
-                buttonsHtml = `
-                    <button class="btn btn-success" id="downloadCompliantBtn">✅ Download Compliant PDF</button>
-                    <button class="btn btn-secondary" id="downloadScorecardBtn">📊 Download Scorecard</button>
-                `;
-            }
-            actionButtonsDiv.innerHTML = buttonsHtml;
-
-            // Attach event listeners
-            if (document.getElementById('remediateBtn')) {
-                document.getElementById('remediateBtn').addEventListener('click', () => {
-                    askForRemediation();
-                });
-            }
-            if (document.getElementById('downloadScorecardBtn')) {
-                document.getElementById('downloadScorecardBtn').addEventListener('click', downloadScorecard);
-            }
-            if (document.getElementById('downloadCompliantBtn')) {
-                document.getElementById('downloadCompliantBtn').addEventListener('click', () => {
-                    alert('This PDF is already compliant! You can download it using the button above.');
-                });
-            }
-
-            // Show results, hide loading
-            resultsDiv.style.display = 'block';
-            loading.style.display = 'none';
-            uploadArea.style.opacity = '1';
-        }
-
-        function askForRemediation() {
-            const userConfirmed = confirm(
-                'This PDF failed WCAG 2.1 AA compliance.\n\n' +
-                'Would you like to convert it to a fully accessible, screen reader compatible PDF?\n\n' +
-                'This will add proper tags, reading order, and metadata for JAWS/NVDA support.'
-            );
-            
-            if (userConfirmed) {
-                alert('Remediation feature is ready for backend integration.\n\n' +
-                      'When your server endpoint is ready, this will trigger the PDF conversion process.');
-                // window.location.href = '/remediate';
-            }
-        }
-
-        function downloadScorecard() {
-            if (!currentAnalysisData) return;
-            
-            const scorecardContent = `
-PDF Accessibility Compliance Report
-Generated: ${new Date().toLocaleString()}
-Website: https://checkpdfaccessibility.com
-
-========================================
-OVERALL COMPLIANCE SCORE: ${currentAnalysisData.overallScore}%
-WCAG 2.1 Level AA: ${currentAnalysisData.overallScore >= 80 ? 'PASSING' : 'FAILING'}
-========================================
-
-ISSUES FOUND: ${currentAnalysisData.issues?.length || 0}
-
-${currentAnalysisData.issues?.map((issue, i) => `
-${i+1}. ${issue.wcagCriterion || 'Unspecified Criterion'}
-   Severity: ${issue.severity || 'Unknown'}
-   Fix: ${issue.fixRecommendation || issue.elementLocation || 'No specific recommendation'}
-`).join('\n') || 'No issues found.'}
-
-========================================
-Summary: ${currentAnalysisData.summary || 'Analysis complete.'}
-========================================
-For more details, visit https://checkpdfaccessibility.com
-            `;
-            
-            const blob = new Blob([scorecardContent], { type: 'text/plain' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = `accessibility_scorecard_${Date.now()}.txt`;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            URL.revokeObjectURL(url);
-        }
-    </script>
-</body>
-</html>
+    }
+});
