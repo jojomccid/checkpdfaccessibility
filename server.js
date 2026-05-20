@@ -236,3 +236,164 @@ app.listen(PORT, () => {
     console.log(`API key configured: ${DEEPSEEK_API_KEY ? 'YES' : 'NO'}`);
     console.log(`Uploads directory: ./uploads`);
 });
+
+// Endpoint to analyze PDF with standard selection
+app.post('/api/analyze', upload.single('pdf'), async (req, res) => {
+    let filePath = null;
+    
+    try {
+        if (!req.file) {
+            return res.status(400).json({ error: 'No PDF file uploaded' });
+        }
+
+        // Get selected standard (default to wcag21)
+        const selectedStandard = req.body.standard || 'wcag21';
+        
+        filePath = req.file.path;
+        console.log(`[${new Date().toISOString()}] Processing: ${req.file.originalname} against ${selectedStandard}`);
+
+        // Extract text from PDF
+        const pdfBuffer = fs.readFileSync(filePath);
+        let extractedText = '';
+        
+        try {
+            const pdfData = await pdfParse(pdfBuffer);
+            extractedText = pdfData.text;
+            console.log(`Extracted ${extractedText.length} characters`);
+        } catch (parseError) {
+            console.error('PDF parse error:', parseError.message);
+            extractedText = "Text extraction encountered issues. Analysis will proceed on available content.";
+        }
+        
+        if (!extractedText || extractedText.trim().length < 50) {
+            if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
+            return res.json({
+                overallScore: 0,
+                issues: [{ wcagCriterion: "No readable text", severity: "Critical", fixRecommendation: "This PDF appears to be an image or has no selectable text. OCR processing is required." }],
+                summary: "No text content could be extracted."
+            });
+        }
+
+        const textForAnalysis = extractedText.substring(0, 8000);
+
+        // Build prompt based on selected standard
+        let systemPrompt, analysisPrompt;
+        
+        if (selectedStandard === 'pdfua') {
+            systemPrompt = "You are a PDF/UA-1 (ISO 14289) accessibility compliance expert. PDF/UA requires proper tags (headings, lists, tables), correct reading order, alt text for images, language specification, and no untagged annotations. Respond only with valid JSON.";
+            analysisPrompt = `You are a PDF/UA-1 (ISO 14289) accessibility auditor. 
+            
+Analyze this PDF document text and determine if it would meet PDF/UA-1 requirements. Look for evidence of:
+1. Proper heading structure (H1-H6 hierarchy)
+2. List tags (ul, ol, li)
+3. Table headers (th with scope)
+4. Alt text for images
+5. Document language specification
+6. Logical reading order
+7. Metadata (title, author)
+
+Document text:
+${textForAnalysis}
+
+Respond with ONLY valid JSON in this format:
+{
+    "overallScore": number (0-100),
+    "issues": [
+        {
+            "wcagCriterion": "PDF/UA requirement name",
+            "severity": "Critical/Serious/Minor",
+            "fixRecommendation": "How to fix this issue"
+        }
+    ],
+    "summary": "Overall assessment"
+}`;
+        } else {
+            // WCAG 2.1 AA (default)
+            systemPrompt = "You are a WCAG 2.1 Level AA accessibility compliance expert. Respond only with valid JSON. Do not include explanations, markdown formatting, or any text outside the JSON structure.";
+            analysisPrompt = `You are a WCAG 2.1 Level AA accessibility auditor. 
+            
+Analyze this PDF document text and provide:
+1. An overall compliance score from 0-100%
+2. List of issues found with specific WCAG criteria violations
+3. For each issue, include: severity (Critical/Serious/Minor), WCAG criterion, and fix recommendation
+
+Document text:
+${textForAnalysis}
+
+Respond with ONLY valid JSON in this format:
+{
+    "overallScore": number,
+    "issues": [
+        {
+            "wcagCriterion": string,
+            "severity": string,
+            "fixRecommendation": string
+        }
+    ],
+    "summary": string
+}`;
+        }
+
+        console.log(`Calling DeepSeek API for ${selectedStandard} analysis...`);
+        
+        const deepseekResponse = await axios.post(DEEPSEEK_API_URL, {
+            model: "deepseek-chat",
+            messages: [
+                { role: "system", content: systemPrompt },
+                { role: "user", content: analysisPrompt }
+            ],
+            temperature: 0.3
+        }, {
+            headers: { 
+                'Authorization': `Bearer ${DEEPSEEK_API_KEY}`,
+                'Content-Type': 'application/json'
+            },
+            timeout: 45000
+        });
+
+        let analysisResult;
+        const responseContent = deepseekResponse.data.choices[0].message.content;
+        
+        try {
+            const jsonMatch = responseContent.match(/\{[\s\S]*\}/);
+            if (jsonMatch) {
+                analysisResult = JSON.parse(jsonMatch[0]);
+            } else {
+                analysisResult = JSON.parse(responseContent);
+            }
+        } catch (parseError) {
+            console.error('JSON parse error:', parseError.message);
+            analysisResult = {
+                overallScore: 50,
+                issues: [{ wcagCriterion: "Analysis parsing", severity: "Minor", fixRecommendation: "The analysis completed but had formatting issues." }],
+                summary: "Partial analysis completed."
+            };
+        }
+
+        if (typeof analysisResult.overallScore !== 'number') analysisResult.overallScore = 50;
+
+        // Clean up
+        if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
+
+        // Return result with standard info
+        res.json({
+            [selectedStandard]: analysisResult,
+            standard: selectedStandard,
+            timestamp: new Date().toISOString()
+        });
+
+    } catch (error) {
+        console.error('Analysis error:', error.message);
+        if (filePath && fs.existsSync(filePath)) {
+            try { fs.unlinkSync(filePath); } catch(e) {}
+        }
+        
+        res.status(500).json({ 
+            error: 'Analysis failed', 
+            details: error.message,
+            overallScore: 0,
+            issues: [{ wcagCriterion: "Processing error", severity: "Critical", fixRecommendation: "Please try again." }],
+            summary: 'Unable to complete accessibility analysis.'
+        });
+    }
+});
